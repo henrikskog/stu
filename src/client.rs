@@ -3,10 +3,10 @@ use std::{fmt::Debug, num::NonZero};
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_s3::{config::Region, operation::list_objects_v2::ListObjectsV2Output};
 use chrono::TimeZone;
-use tokio_stream::StreamExt;
 
 use crate::{
     cache::SyncMokaCache,
+    config::Config,
     error::{AppError, Result},
     object::{BucketItem, FileDetail, FileVersion, ObjectItem, RawObject},
 };
@@ -60,7 +60,7 @@ impl Client {
             region,
             bucket_region_cache: SyncMokaCache::new(
                 NonZero::new(1000).unwrap(),
-                "/Users/henrikskog/.stu/cache.json".to_string(),
+                Config::cache_file_path().unwrap(),
             )
             .unwrap(),
         }
@@ -70,7 +70,6 @@ impl Client {
         let result = self.client.list_buckets().send().await;
         let output = result.map_err(|e| AppError::new("Failed to load buckets", e))?;
 
-        // Returns all buckets in account independent of client region
         let buckets: Vec<BucketItem> = output
             .buckets()
             .iter()
@@ -84,27 +83,13 @@ impl Client {
             return Err(AppError::msg("No buckets found"));
         }
 
-        let buckets_region_check = buckets
-            .into_iter()
-            .map(|bucket| {
-                let bucket_clone = bucket.clone();
-                async move {
-                    let result = self.is_bucket_in_region(&bucket.name).await;
-                    println!("{:?}", result);
-                    (result, bucket_clone)
-                }
-            })
-            .collect::<futures::stream::FuturesUnordered<_>>()
-            .collect::<Vec<_>>()
-            .await;
-
-        let filtered_buckets = buckets_region_check
-            .into_iter()
-            .filter_map(|(result, bucket)| match result {
-                Ok(true) => Some(bucket),
-                _ => None,
-            })
-            .collect();
+        let mut filtered_buckets: Vec<BucketItem> = Vec::new();
+        for bucket in buckets {
+            let result = self.is_bucket_in_region(&bucket.name).await;
+            if result.unwrap_or(false) {
+                filtered_buckets.push(bucket);
+            }
+        }
 
         Ok(filtered_buckets)
     }
@@ -165,8 +150,6 @@ impl Client {
         }
 
         Ok(constraint_str == self.region)
-
-        // Ok(constraint_str == self.region);
     }
 
     pub async fn load_bucket(&self, name: &str) -> Result<BucketItem> {

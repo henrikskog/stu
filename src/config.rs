@@ -71,7 +71,7 @@ impl Config {
         Ok(String::from(path.to_string_lossy()))
     }
 
-    pub fn cache_file_path(&self) -> anyhow::Result<String> {
+    pub fn cache_file_path() -> anyhow::Result<String> {
         let dir = Config::get_app_base_dir()?;
         let path = dir.join(CACHE_FILE_NAME);
         Ok(String::from(path.to_string_lossy()))

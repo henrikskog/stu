@@ -1,6 +1,5 @@
 mod app;
 mod cache;
-mod cache_moka;
 mod client;
 mod config;
 mod constant;
