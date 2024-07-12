@@ -1,4 +1,4 @@
-use lru::LruCache;
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
@@ -13,58 +13,54 @@ struct CacheEntry<T> {
     value: T,
 }
 
-pub struct SyncLruCache<T> {
-    pub cache: LruCache<String, T>,
+pub struct SyncMokaCache<T> {
+    pub cache: Cache<String, T>,
     pub file_path: String,
 }
 
-impl<T> fmt::Debug for SyncLruCache<T>
+impl<T> fmt::Debug for SyncMokaCache<T>
 where
-    T: fmt::Debug,
+    T: fmt::Debug + Clone + Send + Sync + 'static, // Added 'static bound
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SyncLruCache")
+        f.debug_struct("SyncMokaCache")
             .field("file_path", &self.file_path)
             .field("cache", &self.cache.iter().collect::<Vec<_>>())
             .finish()
     }
 }
 
-impl<T> SyncLruCache<T>
+impl<T> SyncMokaCache<T>
 where
-    T: Serialize + for<'de> Deserialize<'de> + Clone,
+    T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
 {
     pub fn new(size: NonZeroUsize, file_path: String) -> io::Result<Self>
     where
         T: for<'de> Deserialize<'de>,
     {
-        let cache = if let Ok(mut file) = File::open(&file_path) {
+        println!("Initializing cache with size: {} at {}", size, file_path);
+        let cache = Cache::builder().max_capacity(size.get() as u64).build();
+
+        if let Ok(mut file) = File::open(&file_path) {
             let mut contents = String::new();
             file.read_to_string(&mut contents)?;
             let entries: Vec<CacheEntry<T>> = serde_json::from_str(&contents)?;
-            let mut cache = LruCache::new(size);
             for entry in entries {
-                cache.put(entry.key, entry.value);
+                cache.insert(entry.key, entry.value);
             }
-            cache
-        } else {
-            LruCache::new(size)
-        };
-        Ok(SyncLruCache { cache, file_path })
+        }
+
+        Ok(SyncMokaCache { cache, file_path })
     }
 
-    pub fn put(&mut self, key: String, value: T) -> io::Result<Option<T>> {
-        let result = self.cache.put(key.clone(), value);
+    pub fn put(&self, key: String, value: T) -> io::Result<()> {
+        self.cache.insert(key.clone(), value);
         self.sync_to_file()?;
-        Ok(result)
+        Ok(())
     }
 
-    pub fn get(&mut self, key: &str) -> Option<T> {
-        self.cache.get(key).cloned()
-    }
-
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut T> {
-        self.cache.get_mut(key)
+    pub fn get(&self, key: &str) -> Option<T> {
+        self.cache.get(key)
     }
 
     fn sync_to_file(&self) -> io::Result<()> {
@@ -78,7 +74,7 @@ where
             .cache
             .iter()
             .map(|(k, v)| CacheEntry {
-                key: k.clone(),
+                key: k.to_string(),
                 value: v.clone(),
             })
             .collect();
@@ -92,36 +88,34 @@ where
 
 // fn main2() -> io::Result<()> {
 //     let file_path = "cache.json".to_string();
-//     let mut cache = SyncLruCache::new(NonZeroUsize::new(2).unwrap(), file_path)?;
+//     let cache = SyncMokaCache::new(NonZeroUsize::new(2).unwrap(), file_path)?;
 
 //     println!("{:?}", cache);
 
-//     cache.put("apple".to_string(), 3);
-//     cache.put("banana".to_string(), 2);
+//     cache.put("apple".to_string(), 3)?;
+//     cache.put("banana".to_string(), 2)?;
 
-//         println!("{:?}", cache);
+//     println!("{:?}", cache);
 
-//     assert_eq!(*cache.get("apple").unwrap(), 3);
-//     assert_eq!(*cache.get("banana").unwrap(), 2);
+//     assert_eq!(cache.get("apple").unwrap(), 3);
+//     assert_eq!(cache.get("banana").unwrap(), 2);
 //     assert!(cache.get("pear").is_none());
 
-//     assert_eq!(cache.put("banana".to_string(), 4).unwrap(), Some(2));
-//     assert_eq!(cache.put("pear".to_string(), 5).unwrap(), None);
+//     cache.put("banana".to_string(), 4)?;
+//     cache.put("pear".to_string(), 5)?;
 
 //     println!("{:?}", cache);
 
-//     assert_eq!(*cache.get("pear").unwrap(), 5);
-//     assert_eq!(*cache.get("banana").unwrap(), 4);
+//     assert_eq!(cache.get("pear").unwrap(), 5);
+//     assert_eq!(cache.get("banana").unwrap(), 4);
 //     assert!(cache.get("apple").is_none());
 
-//     {
-//         let v = cache.get_mut("banana").unwrap();
-//         *v = 6;
-//     }
+//     // Moka does not support mutable references directly.
+//     // You might need to use a different approach if mutability is required.
 
 //     println!("{:?}", cache);
 
-//     assert_eq!(*cache.get("banana").unwrap(), 6);
+//     assert_eq!(cache.get("banana").unwrap(), 6);
 
 //     Ok(())
 // }

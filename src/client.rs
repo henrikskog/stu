@@ -6,7 +6,7 @@ use chrono::TimeZone;
 use tokio_stream::StreamExt;
 
 use crate::{
-    cache::SyncLruCache,
+    cache::SyncMokaCache,
     error::{AppError, Result},
     object::{BucketItem, FileDetail, FileVersion, ObjectItem, RawObject},
 };
@@ -17,7 +17,7 @@ const DEFAULT_REGION: &str = "ap-northeast-1";
 pub struct Client {
     pub client: aws_sdk_s3::Client,
     region: String,
-    bucket_region_cache: SyncLruCache<String>,
+    bucket_region_cache: SyncMokaCache<String>,
 }
 
 impl Debug for Client {
@@ -58,9 +58,9 @@ impl Client {
         Client {
             client,
             region,
-            bucket_region_cache: SyncLruCache::new(
-                NonZero::new(100).unwrap(),
-                "cache.json".to_string(),
+            bucket_region_cache: SyncMokaCache::new(
+                NonZero::new(1000).unwrap(),
+                "/Users/henrikskog/.stu/cache.json".to_string(),
             )
             .unwrap(),
         }
@@ -110,12 +110,13 @@ impl Client {
     }
 
     async fn is_bucket_in_region(&self, bucket_name: &str) -> Result<bool> {
-        // let bucket_region_cache_hit = self.bucket_region_cache.get(bucket_name);
+        let bucket_region_cache_hit = self.bucket_region_cache.get(bucket_name);
 
-        let bucket_location = {
-            // if let Some(location) = bucket_region_cache_hit {
-            //     Some(location.clone())
-            // } else {
+        let bucket_location = if let Some(location) = bucket_region_cache_hit.clone() {
+            println!("Cache hit! Bucket: {}, Region: {}", bucket_name, location);
+            Some(location.clone())
+        } else {
+            println!("Cache miss! Bucket: {}", bucket_name);
             let location = self
                 .client
                 .get_bucket_location()
@@ -128,8 +129,6 @@ impl Client {
                         e,
                     )
                 })?;
-            // self.bucket_region_cache
-            //     .put(bucket.name.clone(), location.clone());
             let res = location.location_constraint().unwrap().as_str();
             Some(res.to_string())
         };
@@ -146,6 +145,24 @@ impl Client {
                 )))
             }
         };
+
+        if bucket_region_cache_hit.is_none() {
+            let res = self
+                .bucket_region_cache
+                .put(bucket_name.to_string(), constraint_str.to_string());
+
+            match res {
+                Ok(_) => {
+                    println!(
+                        "Cache put success! Bucket: {}, Region: {}",
+                        bucket_name, constraint_str
+                    );
+                }
+                Err(e) => {
+                    println!("Error putting bucket region cache: {}", e);
+                }
+            }
+        }
 
         Ok(constraint_str == self.region)
 
