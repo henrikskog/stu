@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use tokio::spawn;
 
+use std::num::NonZeroUsize;
+
 use crate::{
+    cache::SyncLruCache,
     client::Client,
     config::Config,
     error::{AppError, Result},
@@ -57,10 +60,17 @@ pub struct App {
     client: Option<Arc<Client>>,
     config: Config,
     tx: Sender,
+    cache: SyncLruCache<String>,
 }
 
 impl App {
     pub fn new(config: Config, tx: Sender, width: usize, height: usize) -> App {
+        let cache = SyncLruCache::new(
+            NonZeroUsize::new(100).unwrap(),
+            config.cache_file_path().unwrap(),
+        )
+        .expect("Failed to create cache");
+
         App {
             app_view_state: AppViewState::new(width, height),
             app_objects: AppObjects::default(),
@@ -68,6 +78,7 @@ impl App {
             client: None,
             config,
             tx,
+            cache,
         }
     }
 

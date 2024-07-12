@@ -1,10 +1,12 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, num::NonZero};
 
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_s3::{config::Region, operation::list_objects_v2::ListObjectsV2Output};
 use chrono::TimeZone;
+use tokio_stream::StreamExt;
 
 use crate::{
+    cache::SyncLruCache,
     error::{AppError, Result},
     object::{BucketItem, FileDetail, FileVersion, ObjectItem, RawObject},
 };
@@ -15,6 +17,7 @@ const DEFAULT_REGION: &str = "ap-northeast-1";
 pub struct Client {
     pub client: aws_sdk_s3::Client,
     region: String,
+    bucket_region_cache: SyncLruCache<String>,
 }
 
 impl Debug for Client {
@@ -52,14 +55,22 @@ impl Client {
         let client = aws_sdk_s3::Client::from_conf(config);
         let region = sdk_config.region().unwrap().to_string();
 
-        Client { client, region }
+        Client {
+            client,
+            region,
+            bucket_region_cache: SyncLruCache::new(
+                NonZero::new(100).unwrap(),
+                "cache.json".to_string(),
+            )
+            .unwrap(),
+        }
     }
 
     pub async fn load_all_buckets(&self) -> Result<Vec<BucketItem>> {
         let result = self.client.list_buckets().send().await;
         let output = result.map_err(|e| AppError::new("Failed to load buckets", e))?;
 
-        // Returns all buckets in account independant of client region
+        // Returns all buckets in account independent of client region
         let buckets: Vec<BucketItem> = output
             .buckets()
             .iter()
@@ -73,44 +84,72 @@ impl Client {
             return Err(AppError::msg("No buckets found"));
         }
 
-        let mut buckets_in_region: Vec<BucketItem> = Vec::new();
-        for bucket in buckets {
-            let bucket_location = self
+        let buckets_region_check = buckets
+            .into_iter()
+            .map(|bucket| {
+                let bucket_clone = bucket.clone();
+                async move {
+                    let result = self.is_bucket_in_region(&bucket.name).await;
+                    println!("{:?}", result);
+                    (result, bucket_clone)
+                }
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>()
+            .collect::<Vec<_>>()
+            .await;
+
+        let filtered_buckets = buckets_region_check
+            .into_iter()
+            .filter_map(|(result, bucket)| match result {
+                Ok(true) => Some(bucket),
+                _ => None,
+            })
+            .collect();
+
+        Ok(filtered_buckets)
+    }
+
+    async fn is_bucket_in_region(&self, bucket_name: &str) -> Result<bool> {
+        // let bucket_region_cache_hit = self.bucket_region_cache.get(bucket_name);
+
+        let bucket_location = {
+            // if let Some(location) = bucket_region_cache_hit {
+            //     Some(location.clone())
+            // } else {
+            let location = self
                 .client
                 .get_bucket_location()
-                .bucket(bucket.name.as_str())
+                .bucket(bucket_name)
                 .send()
-                .await;
+                .await
+                .map_err(|e| {
+                    AppError::new(
+                        format!("Failed to get bucket location for bucket {}", bucket_name),
+                        e,
+                    )
+                })?;
+            // self.bucket_region_cache
+            //     .put(bucket.name.clone(), location.clone());
+            let res = location.location_constraint().unwrap().as_str();
+            Some(res.to_string())
+        };
 
-            let location = bucket_location.map_err(|e| {
-                AppError::new(
-                    format!("Failed to get bucket location for bucket {}", bucket.name),
-                    e,
-                )
-            })?;
-
-            if let Some(constraint) = location.location_constraint() {
-                let constraint_str = match constraint.as_str() {
-                    // For us-east-1, `location.location_constraint()` returns Some<Unknown<UnknownVariantValue("")>>, with it's `as_str()` returning "".
-                    // We explicitly handle this case by mapping it to "us-east-1".
-                    "" => "us-east-1",
-                    other => other,
-                };
-
-                if constraint_str == self.region {
-                    buckets_in_region.push(bucket);
-                }
+        let constraint_str = match bucket_location.as_deref() {
+            // For us-east-1, `location.location_constraint()` returns Some<Unknown<UnknownVariantValue("")>>, with its `as_str()` returning "".
+            // We explicitly handle this case by mapping it to "us-east-1".
+            Some("") => "us-east-1",
+            Some(other) => other,
+            None => {
+                return Err(AppError::msg(format!(
+                    "Failed to get bucket location for bucket {}",
+                    bucket_name
+                )))
             }
-        }
+        };
 
-        if buckets_in_region.is_empty() {
-            return Err(AppError::msg(format!(
-                "Found no buckets in region {}",
-                self.region
-            )));
-        }
+        Ok(constraint_str == self.region)
 
-        Ok(buckets_in_region)
+        // Ok(constraint_str == self.region);
     }
 
     pub async fn load_bucket(&self, name: &str) -> Result<BucketItem> {
@@ -359,4 +398,35 @@ fn parse_path(path: &str, dir: bool) -> Vec<String> {
 fn convert_datetime(dt: &aws_smithy_types::DateTime) -> chrono::DateTime<chrono::Local> {
     let nanos = dt.as_nanos();
     chrono::Local.timestamp_nanos(nanos as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio;
+
+    #[tokio::test]
+    async fn test_load_all_buckets() {
+        // Instantiate the client with default region and no endpoint or profile
+        let client = Client::new(Some("eu-north-1".to_string()), None, None).await;
+
+        // Call the load_all_buckets method
+        let result = client.load_all_buckets().await;
+
+        println!("{:?}", result);
+
+        // Check if the result is Ok
+        assert!(result.is_ok());
+
+        // Get the buckets from the result
+        let buckets = result.unwrap();
+
+        // Print the buckets for debugging purposes
+        for bucket in &buckets {
+            println!("Bucket: {}", bucket.name);
+        }
+
+        // Assert that the buckets list is not empty
+        assert!(!buckets.is_empty());
+    }
 }
